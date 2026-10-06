@@ -1,10 +1,13 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import DilutionInput from '../components/common/DilutionInput.vue'
+import EmptyPanel from '../components/common/EmptyPanel.vue'
 import StatBadge from '../components/common/StatBadge.vue'
 import { useDeveloperStore } from '../stores/developerStore'
+import { useLedgerStore } from '../stores/ledgerStore'
 import type { Developer, DeveloperCategory, DeveloperState, Dilution } from '../types/developer'
+import type { LiquidLedgerEntry } from '../types/liquid-ledger'
 import { calculateStockVolume, remainingRolls } from '../utils/ratio'
 
 interface DeveloperForm {
@@ -19,6 +22,7 @@ interface DeveloperForm {
 }
 
 const developerStore = useDeveloperStore()
+const ledgerStore = useLedgerStore()
 const showForm = ref(false)
 const saving = ref(false)
 const form = reactive<DeveloperForm>({
@@ -31,6 +35,41 @@ const form = reactive<DeveloperForm>({
   usedRolls: 0,
   state: '新配'
 })
+
+// 台账净占用为余量的唯一真相；developer.usedRolls 只是账面缓存
+function usedOf(developer: Developer): number {
+  return ledgerStore.usedByDeveloper(developer.id!)
+}
+
+function remainingOf(developer: Developer): number {
+  return remainingRolls(developer.maxRolls, usedOf(developer))
+}
+
+const ledgerFlow = computed(() => ledgerStore.recentEntries.slice(0, 8))
+
+function developerName(developerId: number | null): string {
+  if (developerId === null) return '未知来源'
+  return developerStore.developers.find((item) => item.id === developerId)?.name ?? '未知来源'
+}
+
+const entryKindMeta: Record<LiquidLedgerEntry['kind'], { label: string, tone: 'cyan' | 'rose' | 'amber' }> = {
+  occupy: { label: '占用', tone: 'amber' },
+  opening: { label: '期初', tone: 'cyan' },
+  reverse: { label: '冲正', tone: 'rose' }
+}
+
+function entryKindLabel(entry: LiquidLedgerEntry): string {
+  return entry.source === 'unknown' ? '未知来源' : entryKindMeta[entry.kind].label
+}
+
+function entryKindTone(entry: LiquidLedgerEntry): 'cyan' | 'rose' | 'amber' {
+  return entry.source === 'unknown' ? 'amber' : entryKindMeta[entry.kind].tone
+}
+
+function formatEntryTime(createdAt: string): string {
+  const text = createdAt.replace('T', ' ')
+  return text.length > 16 ? text.slice(0, 16) : text
+}
 
 function stateTone(developer: Developer): 'cyan' | 'amber' | 'rose' {
   if (developer.state === '报废') return 'rose'
@@ -71,7 +110,7 @@ async function scrapDeveloper(id?: number): Promise<void> {
 }
 
 onMounted(() => {
-  void developerStore.load()
+  void Promise.all([developerStore.load(), ledgerStore.load()])
 })
 </script>
 
@@ -81,7 +120,7 @@ onMounted(() => {
       <div>
         <span class="eyebrow">CHEMISTRY DESK</span>
         <h1>显影液配制与余量</h1>
-        <p>记录配制日期与可冲卷数，剩余量归零前及时安排补充或标记报废。</p>
+        <p>记录配制日期与可冲卷数；余量以用液台账净占用为准，归零前及时安排补充或标记报废。</p>
       </div>
       <button type="button" class="primary-button" data-testid="new-developer" @click="showForm = !showForm">
         {{ showForm ? '收起表单' : '新建显影液' }}
@@ -90,7 +129,7 @@ onMounted(() => {
 
     <div class="stat-strip">
       <StatBadge label="工作液总数" :value="developerStore.developers.length" hint="含新配与报废记录" tone="cyan" />
-      <StatBadge label="可用余量" :value="developerStore.availableRolls" hint="按剩余可冲卷数合计" tone="amber" />
+      <StatBadge label="可用余量" :value="developerStore.availableRolls" hint="按用液台账净占用合计" tone="amber" />
       <StatBadge label="已报废" :value="developerStore.developers.filter((item) => item.state === '报废').length" hint="不再计入可用余量" tone="rose" />
     </div>
 
@@ -140,8 +179,9 @@ onMounted(() => {
           <input v-model.number="form.maxRolls" data-testid="field-maxRolls" type="number" min="1" max="100" />
         </label>
         <label>
-          <span>已冲卷数</span>
+          <span>期初已冲卷数</span>
           <input v-model.number="form.usedRolls" data-testid="field-usedRolls" type="number" min="0" max="100" />
+          <small class="field-hint">登记后写入台账期初占用，之后余量以台账为准</small>
         </label>
       </div>
       <div class="form-actions">
@@ -187,16 +227,49 @@ onMounted(() => {
           </dl>
           <div class="life-meter">
             <div class="life-meter__head">
-              <span>剩余 {{ remainingRolls(developer.maxRolls, developer.usedRolls) }} 卷</span>
-              <span>已用 {{ developer.usedRolls }} / {{ developer.maxRolls }}</span>
+              <span>剩余 {{ remainingOf(developer) }} 卷</span>
+              <span>台账已用 {{ usedOf(developer) }} / {{ developer.maxRolls }}</span>
             </div>
             <div class="life-meter__track">
-              <i :style="{ width: `${Math.min(100, developer.usedRolls / developer.maxRolls * 100)}%` }"></i>
+              <i :style="{ width: `${Math.min(100, usedOf(developer) / developer.maxRolls * 100)}%` }"></i>
             </div>
-            <small v-if="remainingRolls(developer.maxRolls, developer.usedRolls) === 0">余量已耗尽，建议报废并重新配制。</small>
+            <small v-if="remainingOf(developer) === 0">台账余量已耗尽，新冲洗记录会被拦下；可改用其他在用工作液，或报废当前瓶后重新配制。</small>
           </div>
         </div>
       </article>
     </div>
+
+    <section class="ledger-panel" data-testid="ledger-panel">
+      <header class="ledger-panel__head">
+        <div>
+          <h2>用液台账</h2>
+          <p>每次确认实冲占用一卷，撤销保留原记录并追加冲正；余量有争议时以本台账净占用为准。</p>
+        </div>
+        <span class="status-chip status--cyan">共 {{ ledgerStore.entries.length }} 条流水</span>
+      </header>
+      <table v-if="ledgerFlow.length" class="ledger-table">
+        <thead>
+          <tr>
+            <th>时间</th>
+            <th>批次号</th>
+            <th>类型</th>
+            <th>工作液</th>
+            <th class="num">卷数</th>
+            <th>备注</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="entry in ledgerFlow" :key="entry.id" data-testid="row-ledger">
+            <td>{{ formatEntryTime(entry.createdAt) }}</td>
+            <td>{{ entry.batchNo }}</td>
+            <td><span class="status-chip" :class="`status--${entryKindTone(entry)}`">{{ entryKindLabel(entry) }}</span></td>
+            <td>{{ developerName(entry.developerId) }}</td>
+            <td class="num" :class="{ 'text-danger': entry.rolls < 0 }">{{ entry.rolls > 0 ? `+${entry.rolls}` : entry.rolls }}</td>
+            <td class="ledger-note">{{ entry.note }}</td>
+          </tr>
+        </tbody>
+      </table>
+      <EmptyPanel v-else title="暂无台账流水" description="确认第一条冲洗记录后会在此生成占用记录。" />
+    </section>
   </section>
 </template>

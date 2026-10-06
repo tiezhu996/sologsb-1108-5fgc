@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { useRoute } from 'vue-router'
 import EmptyPanel from '../components/common/EmptyPanel.vue'
 import FilterBar from '../components/common/FilterBar.vue'
@@ -8,9 +8,12 @@ import PushPullTag from '../components/common/PushPullTag.vue'
 import { useTempCompensate } from '../hooks/useTempCompensate'
 import { useDeveloperStore } from '../stores/developerStore'
 import { useFilmStore } from '../stores/filmStore'
+import { useLedgerStore } from '../stores/ledgerStore'
 import { useRecipeStore } from '../stores/recipeStore'
 import { useRunStore } from '../stores/runStore'
 import type { TankType } from '../types/dev-run'
+import { LiquidLedgerError } from '../types/liquid-ledger'
+import { remainingRolls } from '../utils/ratio'
 
 interface FilterValue {
   keyword: string
@@ -30,10 +33,12 @@ interface RunForm {
 const route = useRoute()
 const filmStore = useFilmStore()
 const developerStore = useDeveloperStore()
+const ledgerStore = useLedgerStore()
 const recipeStore = useRecipeStore()
 const runStore = useRunStore()
 const showForm = ref(false)
 const saving = ref(false)
+const reversingId = ref<number | null>(null)
 const today = new Date().toISOString().slice(0, 10)
 
 const querySelections = (key: string): string[] => {
@@ -61,6 +66,26 @@ const form = reactive<RunForm>({
 
 const selectedRecipe = computed(() => recipeStore.recipes.find((recipe) => recipe.id === form.recipeId))
 const referenceTemp = computed(() => selectedRecipe.value?.tempC ?? 20)
+
+// 当前配方对应工作液的台账视角：余量以台账净占用为准
+const selectedDeveloperInfo = computed(() => {
+  const recipe = selectedRecipe.value
+  const developer = developerStore.developers.find((item) => item.id === recipe?.developerId)
+  if (!recipe || !developer || developer.id === undefined) {
+    return { developer: null, used: 0, remaining: 0 }
+  }
+  const used = ledgerStore.usedByDeveloper(developer.id)
+  return { developer, used, remaining: remainingRolls(developer.maxRolls, used) }
+})
+
+// 仍有余量的其他在用工作液，供到上限时给出改选提示
+const alternativeCount = computed(() => {
+  const currentId = selectedDeveloperInfo.value.developer?.id
+  return developerStore.developers.filter((item) => {
+    if (item.id === undefined || item.id === currentId || item.state === '报废') return false
+    return ledgerStore.usedByDeveloper(item.id) < item.maxRolls
+  }).length
+})
 const { suggest } = useTempCompensate(referenceTemp)
 const suggestion = computed(() => {
   const recipe = selectedRecipe.value
@@ -111,11 +136,25 @@ async function submitRun(): Promise<void> {
     ElMessage.warning('请填写批次号、配方与结果评价')
     return
   }
+  // 提交前先以台账视角拦一道：报废 / 已达上限都不允许新开记录
+  const { developer, used, remaining } = selectedDeveloperInfo.value
+  if (!developer) {
+    ElMessage.error('该配方关联的工作液来源缺失，无法占用余量，请改选来源明确的配方')
+    return
+  }
+  if (developer.state === '报废') {
+    ElMessage.error(`工作液「${developer.name}」已报废，不能再占用；请改用其他在用工作液或先报废当前瓶后改选配方`)
+    return
+  }
+  if (remaining < 1) {
+    ElMessage.error(
+      `工作液「${developer.name}」已达可冲上限（${used}/${developer.maxRolls}），已拦住新记录。` +
+      (alternativeCount.value > 0 ? `可改用其他 ${alternativeCount.value} 个仍有余量的在用工作液` : '请先报废当前瓶并重新配制')
+    )
+    return
+  }
+
   saving.value = true
-  const selectedDeveloper = developerStore.developers.find((item) => item.id === selectedRecipe.value?.developerId)
-  const willExceedLimit = selectedDeveloper !== undefined
-    && selectedDeveloper.state !== '报废'
-    && selectedDeveloper.usedRolls + 1 > selectedDeveloper.maxRolls
   try {
     await runStore.addRun({
       batchNo: form.batchNo.trim(),
@@ -126,17 +165,60 @@ async function submitRun(): Promise<void> {
       runDate: form.runDate,
       result: form.result.trim()
     })
-    await Promise.all([developerStore.load(), recipeStore.load()])
-    if (willExceedLimit) {
-      ElMessage.warning('冲洗记录已保存，本次已超过显影液标称可冲上限，请评估后标记报废')
-    } else {
-      ElMessage.success('冲洗记录已保存，显影液用量同步更新')
-    }
+    ElMessage.success('冲洗记录已确认，用液台账已占用一卷，余量同步更新')
     form.batchNo = `R-${today.replace(/-/g, '')}-${String(runStore.runs.length + 1).padStart(2, '0')}`
     form.result = ''
     showForm.value = false
+  } catch (error) {
+    if (error instanceof LiquidLedgerError) {
+      // 冲突/拦截发生时以数据库为准重新拉取，后提交方看到已被占用的最新状态
+      await Promise.all([runStore.load(), ledgerStore.load(), developerStore.load()])
+      ElMessage.error(error.message)
+    } else {
+      // 事务已整体回滚到写入前状态；表单内容保留，可直接重试
+      ElMessage.error('写入失败，数据已恢复到提交前状态，请重试或检查浏览器存储权限')
+    }
   } finally {
     saving.value = false
+  }
+}
+
+function runIsReversed(batchNo: string): boolean {
+  return ledgerStore.reversedBatches.has(batchNo)
+}
+
+// 未知来源（迁移缺失 / 配方找不到工作液）的占用在台账中 developerId 为空
+function runSourceUnknown(batchNo: string): boolean {
+  return ledgerStore.entries.some(
+    (entry) => entry.batchNo === batchNo && entry.kind === 'occupy' && entry.source === 'unknown'
+  )
+}
+
+async function reverseRun(runId?: number): Promise<void> {
+  if (runId === undefined) return
+  const run = runStore.runs.find((item) => item.id === runId)
+  try {
+    await ElMessageBox.confirm(
+      `将保留批次「${run?.batchNo ?? runId}」的原始冲洗记录，并在用液台账追加一条冲正返还余量，确定撤销？`,
+      '撤销本次实冲',
+      { confirmButtonText: '追加冲正', cancelButtonText: '再想想', type: 'warning' }
+    )
+  } catch {
+    return
+  }
+  reversingId.value = runId
+  try {
+    await runStore.reverseRun(runId)
+    ElMessage.success('已追加冲正记录，原冲洗记录保留，余量已返还')
+  } catch (error) {
+    if (error instanceof LiquidLedgerError) {
+      await Promise.all([runStore.load(), ledgerStore.load(), developerStore.load()])
+      ElMessage.error(error.message)
+    } else {
+      ElMessage.error('写入失败，数据已恢复到撤销前状态，请重试')
+    }
+  } finally {
+    reversingId.value = null
   }
 }
 
@@ -148,7 +230,7 @@ async function writeBack(recipeId?: number, runId?: number): Promise<void> {
 }
 
 onMounted(async () => {
-  await Promise.all([filmStore.load(), developerStore.load(), recipeStore.load(), runStore.load()])
+  await Promise.all([filmStore.load(), developerStore.load(), ledgerStore.load(), recipeStore.load(), runStore.load()])
   if (recipeStore.recipes[0]?.id !== undefined) {
     form.recipeId = recipeStore.recipes[0].id
   }
@@ -214,9 +296,17 @@ onMounted(async () => {
         </label>
         <div class="span-3 compensation-callout">
           <div>
-            <strong>温度补偿建议</strong>
-            <p v-if="suggestion">{{ suggestion.advice }}；显影液用量会在保存后加一卷。</p>
+            <strong>温度补偿建议与用液台账</strong>
+            <p v-if="suggestion">{{ suggestion.advice }}；确认保存后用液台账占用一卷。</p>
             <p v-else>请选择一条配方后查看修正建议。</p>
+            <p v-if="selectedDeveloperInfo.developer" class="liquid-hint">
+              工作液「{{ selectedDeveloperInfo.developer.name }}」台账余量：
+              <strong :class="{ 'text-danger': selectedDeveloperInfo.remaining < 1 }">
+                剩 {{ selectedDeveloperInfo.remaining }} 卷（已占 {{ selectedDeveloperInfo.used }}/{{ selectedDeveloperInfo.developer.maxRolls }}）
+              </strong>
+              <template v-if="selectedDeveloperInfo.developer.state === '报废'">· 该瓶已报废，新记录会被拦下</template>
+              <template v-else-if="selectedDeveloperInfo.remaining < 1">· 已达上限，请改用其他在用工作液或先报废当前瓶</template>
+            </p>
           </div>
           <button type="button" class="ghost-button" :disabled="!suggestion" @click="applySuggestion">采用修正时间</button>
         </div>
@@ -252,7 +342,11 @@ onMounted(async () => {
         <div class="run-card__body">
           <div class="entity-card__title">
             <div>
-              <h2>{{ run.batchNo }}</h2>
+              <h2>
+                {{ run.batchNo }}
+                <span v-if="runIsReversed(run.batchNo)" class="status-chip status--rose">已冲正</span>
+                <span v-else-if="runSourceUnknown(run.batchNo)" class="status-chip status--amber">未知来源</span>
+              </h2>
               <p>{{ recipeLabel(run.recipeId) }}</p>
             </div>
             <PushPullTag v-if="recipeForRun(run.recipeId)" :value="recipeForRun(run.recipeId)?.pushPull ?? 'N'" />
@@ -264,8 +358,18 @@ onMounted(async () => {
           </div>
           <blockquote>{{ run.result }}</blockquote>
           <div class="run-card__foot">
-            <small v-if="recipeForRun(run.recipeId)?.note">配方注释：{{ recipeForRun(run.recipeId)?.note }}</small>
-            <button type="button" class="text-button" @click="writeBack(run.recipeId, run.id)">回写配方注释</button>
+            <small v-if="runIsReversed(run.batchNo)">台账已追加冲正，本记录保留且余量已返还</small>
+            <small v-else-if="runSourceUnknown(run.batchNo)">占用来源缺失，按未知来源保留、未扣减余量</small>
+            <small v-else-if="recipeForRun(run.recipeId)?.note">配方注释：{{ recipeForRun(run.recipeId)?.note }}</small>
+            <span class="run-card__actions">
+              <button type="button" class="text-button" @click="writeBack(run.recipeId, run.id)">回写配方注释</button>
+              <button
+                type="button"
+                class="text-button text-button--danger"
+                :disabled="runIsReversed(run.batchNo) || reversingId === run.id"
+                @click="reverseRun(run.id)"
+              >{{ reversingId === run.id ? '冲正中…' : '撤销（追加冲正）' }}</button>
+            </span>
           </div>
         </div>
       </article>

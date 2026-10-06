@@ -961,6 +961,25 @@ td em {
   font-size: 11px;
 }
 
+.run-card__actions {
+  display: inline-flex;
+  gap: 12px;
+  flex-shrink: 0;
+}
+
+.run-card__actions .text-button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.liquid-hint {
+  margin-top: 4px;
+}
+
+.liquid-hint .text-danger {
+  color: var(--danger);
+}
+
 .compensation-callout {
   display: flex;
   justify-content: space-between;
@@ -1101,4 +1120,69 @@ td em {
   .footer {
     flex-direction: column;
   }
+}
+
+.field-hint {
+  grid-column: 1 / -1;
+  color: var(--ink-soft);
+  font-size: 10px;
+}
+
+.ledger-panel {
+  margin-top: 22px;
+  padding: 18px;
+  border: 1px solid #e3d6c2;
+  border-radius: 14px;
+  background: #fffdf8;
+}
+
+.ledger-panel__head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+  margin-bottom: 12px;
+}
+
+.ledger-panel__head h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.ledger-panel__head p {
+  margin: 4px 0 0;
+  color: var(--ink-soft);
+  font-size: 11px;
+}
+
+.ledger-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.ledger-table th,
+.ledger-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid #efe6d6;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.ledger-table th {
+  color: var(--ink-soft);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.ledger-table td.num,
+.ledger-table th.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.ledger-table .ledger-note {
+  white-space: normal;
+  color: var(--ink-soft);
 }

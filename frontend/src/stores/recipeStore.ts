@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
-import { db, plain } from '../utils/db'
+import { db, plain, CURRENT_SCHEMA_REV } from '../utils/db'
+import { publishSync } from '../utils/sync-channel'
 import { calculateCompensatedMinutes } from '../hooks/useTempCompensate'
 import type { DevRecipe } from '../types/dev-recipe'
 import type { Dilution } from '../types/developer'
@@ -40,13 +41,15 @@ export const useRecipeStore = defineStore('recipe', {
       }
     },
     async addRecipe(payload: NewRecipe): Promise<number> {
-      const next = { ...payload, schemaRev: 2 }
+      const next = { ...payload, schemaRev: CURRENT_SCHEMA_REV }
       const id = await db.recipes.add(plain(next))
+      publishSync('recipe')
       await this.load()
       return id
     },
     async updateNote(id: number, note: string): Promise<void> {
       await db.recipes.update(id, plain({ note }))
+      publishSync('recipe')
       await this.load()
     }
   }

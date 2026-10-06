@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { db, plain } from '../utils/db'
+import { db, plain, CURRENT_SCHEMA_REV } from '../utils/db'
 import type { FilmStock } from '../types/film-stock'
 
 type NewFilm = Omit<FilmStock, 'id' | 'schemaRev'>
@@ -23,7 +23,7 @@ export const useFilmStore = defineStore('film', {
       }
     },
     async addFilm(payload: NewFilm): Promise<number> {
-      const next = { ...payload, schemaRev: 2 }
+      const next = { ...payload, schemaRev: CURRENT_SCHEMA_REV }
       const id = await db.films.add(plain(next))
       await this.load()
       return id
