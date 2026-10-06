@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { useRoute } from 'vue-router'
 import EmptyPanel from '../components/common/EmptyPanel.vue'
 import FilterBar from '../components/common/FilterBar.vue'
@@ -8,9 +8,11 @@ import PushPullTag from '../components/common/PushPullTag.vue'
 import { useTempCompensate } from '../hooks/useTempCompensate'
 import { useDeveloperStore } from '../stores/developerStore'
 import { useFilmStore } from '../stores/filmStore'
+import { useLedgerStore } from '../stores/ledgerStore'
 import { useRecipeStore } from '../stores/recipeStore'
 import { useRunStore } from '../stores/runStore'
-import type { TankType } from '../types/dev-run'
+import { isLedgerRejection } from '../utils/ledger'
+import type { DevRun, TankType } from '../types/dev-run'
 
 interface FilterValue {
   keyword: string
@@ -30,6 +32,7 @@ interface RunForm {
 const route = useRoute()
 const filmStore = useFilmStore()
 const developerStore = useDeveloperStore()
+const ledgerStore = useLedgerStore()
 const recipeStore = useRecipeStore()
 const runStore = useRunStore()
 const showForm = ref(false)
@@ -60,6 +63,14 @@ const form = reactive<RunForm>({
 })
 
 const selectedRecipe = computed(() => recipeStore.recipes.find((recipe) => recipe.id === form.recipeId))
+const selectedDeveloper = computed(() => developerStore.developers.find(
+  (developer) => developer.id === selectedRecipe.value?.developerId
+))
+const selectedRemaining = computed(() => {
+  const developer = selectedDeveloper.value
+  if (!developer) return null
+  return developerStore.ledgerRemainingRolls(developer)
+})
 const referenceTemp = computed(() => selectedRecipe.value?.tempC ?? 20)
 const { suggest } = useTempCompensate(referenceTemp)
 const suggestion = computed(() => {
@@ -106,16 +117,16 @@ function applySuggestion(): void {
   form.actualMinutes = suggestion.value.minutes
 }
 
+async function refreshAfterWrite(): Promise<void> {
+  await Promise.all([runStore.load(), developerStore.load(), ledgerStore.load(), recipeStore.load()])
+}
+
 async function submitRun(): Promise<void> {
   if (!form.batchNo.trim() || !form.recipeId || !form.result.trim()) {
     ElMessage.warning('请填写批次号、配方与结果评价')
     return
   }
   saving.value = true
-  const selectedDeveloper = developerStore.developers.find((item) => item.id === selectedRecipe.value?.developerId)
-  const willExceedLimit = selectedDeveloper !== undefined
-    && selectedDeveloper.state !== '报废'
-    && selectedDeveloper.usedRolls + 1 > selectedDeveloper.maxRolls
   try {
     await runStore.addRun({
       batchNo: form.batchNo.trim(),
@@ -126,17 +137,50 @@ async function submitRun(): Promise<void> {
       runDate: form.runDate,
       result: form.result.trim()
     })
-    await Promise.all([developerStore.load(), recipeStore.load()])
-    if (willExceedLimit) {
-      ElMessage.warning('冲洗记录已保存，本次已超过显影液标称可冲上限，请评估后标记报废')
-    } else {
-      ElMessage.success('冲洗记录已保存，显影液用量同步更新')
-    }
+    await refreshAfterWrite()
+    ElMessage.success('冲洗记录已保存，台账已为当前工作液占用 1 卷')
     form.batchNo = `R-${today.replace(/-/g, '')}-${String(runStore.runs.length + 1).padStart(2, '0')}`
     form.result = ''
     showForm.value = false
+  } catch (error) {
+    // 事务已回滚到写入前状态，重新加载保持界面与台账一致，表单内容保留可直接重试
+    await refreshAfterWrite()
+    if (isLedgerRejection(error)) {
+      ElMessage.error(error.message)
+    } else {
+      ElMessage.error('写入失败，数据已恢复到写入前状态，请重试')
+    }
   } finally {
     saving.value = false
+  }
+}
+
+async function confirmRevoke(run: DevRun): Promise<void> {
+  if (run.id === undefined) return
+  try {
+    await ElMessageBox.confirm(
+      `撤销批次 ${run.batchNo} 的用液占用？原冲洗记录与占用台账保留，台账将追加一笔冲正。`,
+      '撤销用液占用',
+      { confirmButtonText: '确认撤销', cancelButtonText: '取消', type: 'warning' }
+    )
+  } catch {
+    return
+  }
+  try {
+    const result = await runStore.revokeRun(run.id)
+    await refreshAfterWrite()
+    if (result === 'already-revoked') {
+      ElMessage.info('该批次此前已撤销，台账未重复冲正')
+    } else {
+      ElMessage.success('已撤销占用，原记录保留，台账追加冲正 1 卷')
+    }
+  } catch (error) {
+    await refreshAfterWrite()
+    if (isLedgerRejection(error)) {
+      ElMessage.error(error.message)
+    } else {
+      ElMessage.error('撤销失败，数据已恢复到写入前状态，请重试')
+    }
   }
 }
 
@@ -148,7 +192,7 @@ async function writeBack(recipeId?: number, runId?: number): Promise<void> {
 }
 
 onMounted(async () => {
-  await Promise.all([filmStore.load(), developerStore.load(), recipeStore.load(), runStore.load()])
+  await Promise.all([filmStore.load(), developerStore.load(), ledgerStore.load(), recipeStore.load(), runStore.load()])
   if (recipeStore.recipes[0]?.id !== undefined) {
     form.recipeId = recipeStore.recipes[0].id
   }
@@ -215,8 +259,13 @@ onMounted(async () => {
         <div class="span-3 compensation-callout">
           <div>
             <strong>温度补偿建议</strong>
-            <p v-if="suggestion">{{ suggestion.advice }}；显影液用量会在保存后加一卷。</p>
+            <p v-if="suggestion">{{ suggestion.advice }}；保存后台账为当前工作液占用 1 卷。</p>
             <p v-else>请选择一条配方后查看修正建议。</p>
+            <p v-if="selectedDeveloper" class="ledger-hint" data-testid="ledger-hint">
+              工作液「{{ selectedDeveloper.name }}」台账余量 {{ selectedRemaining }} 卷
+              <template v-if="selectedDeveloper.state === '报废'">，已报废，保存将被拦截，请改用其他在用工作液</template>
+              <template v-else-if="selectedRemaining === 0">，已达上限，保存将被拦截：请改用其他在用工作液，或先报废当前瓶</template>
+            </p>
           </div>
           <button type="button" class="ghost-button" :disabled="!suggestion" @click="applySuggestion">采用修正时间</button>
         </div>
@@ -252,6 +301,11 @@ onMounted(async () => {
         <div class="run-card__body">
           <div class="entity-card__title">
             <div>
+              <span
+                class="status-chip"
+                :class="run.status === '已撤销' ? 'status--rose' : 'status--cyan'"
+                data-testid="run-status"
+              >{{ run.status === '已撤销' ? '已撤销 · 已冲正' : '已确认 · 已占用' }}</span>
               <h2>{{ run.batchNo }}</h2>
               <p>{{ recipeLabel(run.recipeId) }}</p>
             </div>
@@ -265,7 +319,16 @@ onMounted(async () => {
           <blockquote>{{ run.result }}</blockquote>
           <div class="run-card__foot">
             <small v-if="recipeForRun(run.recipeId)?.note">配方注释：{{ recipeForRun(run.recipeId)?.note }}</small>
-            <button type="button" class="text-button" @click="writeBack(run.recipeId, run.id)">回写配方注释</button>
+            <span class="run-card__actions">
+              <button type="button" class="text-button" @click="writeBack(run.recipeId, run.id)">回写配方注释</button>
+              <button
+                v-if="run.status !== '已撤销'"
+                type="button"
+                class="text-button text-button--danger"
+                data-testid="revoke-run"
+                @click="confirmRevoke(run)"
+              >撤销占用</button>
+            </span>
           </div>
         </div>
       </article>
@@ -273,3 +336,18 @@ onMounted(async () => {
     <EmptyPanel v-else title="没有符合条件的冲洗记录" description="调整罐型、结果特点或关键字后重新查看。" />
   </section>
 </template>
+
+<style scoped>
+.ledger-hint {
+  margin-top: 6px !important;
+  color: #315e63 !important;
+  font-weight: 600;
+}
+
+.run-card__actions {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  margin-left: auto;
+}
+</style>

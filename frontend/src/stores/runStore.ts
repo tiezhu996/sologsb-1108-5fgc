@@ -1,8 +1,9 @@
 import { defineStore } from 'pinia'
 import { db, plain } from '../utils/db'
+import { confirmRun, revokeRun, type ConfirmRunPayload, type RevokeResult } from '../utils/ledger'
 import type { DevRun } from '../types/dev-run'
 
-type NewRun = Omit<DevRun, 'id' | 'schemaRev'>
+type NewRun = ConfirmRunPayload
 
 export const useRunStore = defineStore('run', {
   state: () => ({
@@ -24,17 +25,14 @@ export const useRunStore = defineStore('run', {
       }
     },
     async addRun(payload: NewRun): Promise<number> {
-      const next = { ...payload, schemaRev: 2 }
-      const id = await db.runs.add(plain(next))
-      const recipe = await db.recipes.get(payload.recipeId)
-      if (recipe) {
-        const developer = await db.developers.get(recipe.developerId)
-        if (developer && developer.id !== undefined && developer.state !== '报废') {
-          await db.developers.update(developer.id, plain({ usedRolls: developer.usedRolls + 1 }))
-        }
-      }
+      const id = await confirmRun(payload)
       await this.load()
       return id
+    },
+    async revokeRun(runId: number): Promise<RevokeResult> {
+      const result = await revokeRun(runId)
+      await this.load()
+      return result
     },
     async writeBackNote(runId: number, recipeId: number): Promise<void> {
       const run = await db.runs.get(runId)

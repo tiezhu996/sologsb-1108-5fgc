@@ -4,8 +4,9 @@ import { ElMessage } from 'element-plus'
 import DilutionInput from '../components/common/DilutionInput.vue'
 import StatBadge from '../components/common/StatBadge.vue'
 import { useDeveloperStore } from '../stores/developerStore'
+import { useLedgerStore } from '../stores/ledgerStore'
 import type { Developer, DeveloperCategory, DeveloperState, Dilution } from '../types/developer'
-import { calculateStockVolume, remainingRolls } from '../utils/ratio'
+import { calculateStockVolume } from '../utils/ratio'
 
 interface DeveloperForm {
   name: string
@@ -19,6 +20,7 @@ interface DeveloperForm {
 }
 
 const developerStore = useDeveloperStore()
+const ledgerStore = useLedgerStore()
 const showForm = ref(false)
 const saving = ref(false)
 const form = reactive<DeveloperForm>({
@@ -38,6 +40,29 @@ function stateTone(developer: Developer): 'cyan' | 'amber' | 'rose' {
   return 'amber'
 }
 
+function usedOf(developer: Developer): number {
+  return developerStore.ledgerUsedRolls(developer)
+}
+
+function remainingOf(developer: Developer): number {
+  return developerStore.ledgerRemainingRolls(developer)
+}
+
+function summaryOf(developer: Developer) {
+  return developer.id === undefined
+    ? { occupied: 0, reversed: 0, count: 0 }
+    : ledgerStore.summaryByDeveloper(developer.id)
+}
+
+function developerName(id: number | null): string {
+  if (id === null) return '未知工作液'
+  return developerStore.developers.find((item) => item.id === id)?.name ?? '未知工作液'
+}
+
+function formatTime(iso: string): string {
+  return iso.slice(0, 16).replace('T', ' ')
+}
+
 async function submitDeveloper(): Promise<void> {
   if (!form.name.trim() || !form.mixedAt) {
     ElMessage.warning('请填写显影液名称与配制日期')
@@ -52,6 +77,7 @@ async function submitDeveloper(): Promise<void> {
       maxRolls: Math.max(1, form.maxRolls),
       usedRolls: Math.max(0, form.usedRolls)
     })
+    await ledgerStore.load()
     ElMessage.success('显影液工作液已登记')
     form.name = ''
     form.mixedAt = new Date().toISOString().slice(0, 10)
@@ -59,6 +85,8 @@ async function submitDeveloper(): Promise<void> {
     form.usedRolls = 0
     form.state = '新配'
     showForm.value = false
+  } catch {
+    ElMessage.error('写入失败，数据已恢复到写入前状态，请重试')
   } finally {
     saving.value = false
   }
@@ -71,7 +99,7 @@ async function scrapDeveloper(id?: number): Promise<void> {
 }
 
 onMounted(() => {
-  void developerStore.load()
+  void Promise.all([developerStore.load(), ledgerStore.load()])
 })
 </script>
 
@@ -187,16 +215,73 @@ onMounted(() => {
           </dl>
           <div class="life-meter">
             <div class="life-meter__head">
-              <span>剩余 {{ remainingRolls(developer.maxRolls, developer.usedRolls) }} 卷</span>
-              <span>已用 {{ developer.usedRolls }} / {{ developer.maxRolls }}</span>
+              <span>剩余 {{ remainingOf(developer) }} 卷</span>
+              <span>已用 {{ usedOf(developer) }} / {{ developer.maxRolls }}</span>
             </div>
             <div class="life-meter__track">
-              <i :style="{ width: `${Math.min(100, developer.usedRolls / developer.maxRolls * 100)}%` }"></i>
+              <i :style="{ width: `${Math.min(100, usedOf(developer) / developer.maxRolls * 100)}%` }"></i>
             </div>
-            <small v-if="remainingRolls(developer.maxRolls, developer.usedRolls) === 0">余量已耗尽，建议报废并重新配制。</small>
+            <small v-if="remainingOf(developer) === 0">余量已耗尽，建议报废并重新配制。</small>
           </div>
+          <small class="ledger-brief">
+            台账 {{ summaryOf(developer).count }} 条 · 占用 {{ summaryOf(developer).occupied }} 卷 · 冲正 {{ summaryOf(developer).reversed }} 卷
+          </small>
         </div>
       </article>
     </div>
+
+    <div class="panel ledger-panel" data-testid="ledger-panel">
+      <div class="panel__head">
+        <div>
+          <h2>用液台账</h2>
+          <p>每次确认占用一卷，撤销保留原记录并追加冲正；余量有争议时以台账净额为准。</p>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>批次号</th>
+              <th>工作液</th>
+              <th>类型</th>
+              <th>卷数</th>
+              <th>来源</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="entry in ledgerStore.sortedEntries" :key="entry.id" data-testid="row-ledger">
+              <td>{{ formatTime(entry.createdAt) }}</td>
+              <td>
+                <strong>{{ entry.batchNo }}</strong>
+                <small>{{ entry.entryNo }}</small>
+              </td>
+              <td>{{ developerName(entry.developerId) }}</td>
+              <td>
+                <span class="status-chip" :class="entry.kind === '占用' ? 'status--amber' : 'status--cyan'">
+                  {{ entry.kind }}
+                </span>
+              </td>
+              <td>{{ entry.rolls > 0 ? `+${entry.rolls}` : entry.rolls }}</td>
+              <td>{{ entry.source }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-if="ledgerStore.entries.length === 0" class="inline-empty">暂无台账记录，确认冲洗后自动生成。</div>
+      </div>
+    </div>
   </section>
 </template>
+
+<style scoped>
+.ledger-brief {
+  display: block;
+  margin-top: 10px;
+  color: var(--ink-soft);
+  font-size: 11px;
+}
+
+.ledger-panel {
+  margin-top: 16px;
+}
+</style>

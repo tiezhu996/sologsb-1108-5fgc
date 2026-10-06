@@ -1,9 +1,11 @@
 import { defineStore } from 'pinia'
 import { db, plain } from '../utils/db'
+import { registerDeveloper, type NewDeveloperPayload } from '../utils/ledger'
+import { useLedgerStore } from './ledgerStore'
 import type { Developer } from '../types/developer'
 import { remainingRolls } from '../utils/ratio'
 
-type NewDeveloper = Omit<Developer, 'id' | 'schemaRev'>
+type NewDeveloper = NewDeveloperPayload
 
 export const useDeveloperStore = defineStore('developer', {
   state: () => ({
@@ -12,9 +14,19 @@ export const useDeveloperStore = defineStore('developer', {
   }),
   getters: {
     activeDevelopers: (state) => state.developers.filter((developer) => developer.state !== '报废'),
+    /** 已用卷数以用液台账净额为准，账面字段仅作回写缓存 */
+    ledgerUsedRolls(): (developer: Developer) => number {
+      const ledgerStore = useLedgerStore()
+      return (developer) => developer.id === undefined
+        ? developer.usedRolls
+        : Math.max(0, ledgerStore.netUsedByDeveloper(developer.id))
+    },
+    ledgerRemainingRolls(): (developer: Developer) => number {
+      return (developer) => remainingRolls(developer.maxRolls, this.ledgerUsedRolls(developer))
+    },
     availableRolls(): number {
       return this.activeDevelopers.reduce(
-        (sum, developer) => sum + remainingRolls(developer.maxRolls, developer.usedRolls),
+        (sum, developer) => sum + this.ledgerRemainingRolls(developer),
         0
       )
     }
@@ -29,17 +41,9 @@ export const useDeveloperStore = defineStore('developer', {
       }
     },
     async addDeveloper(payload: NewDeveloper): Promise<number> {
-      const next = { ...payload, schemaRev: 2 }
-      const id = await db.developers.add(plain(next))
+      const id = await registerDeveloper(payload)
       await this.load()
       return id
-    },
-    async incrementUsed(id: number): Promise<void> {
-      const developer = await db.developers.get(id)
-      if (!developer) return
-      const usedRolls = developer.usedRolls + 1
-      await db.developers.update(id, plain({ usedRolls }))
-      await this.load()
     },
     async scrap(id: number): Promise<void> {
       await db.developers.update(id, plain({ state: '报废' }))
